@@ -1,0 +1,353 @@
+contract OCH01 {
+
+  const ZERO_ADDRESS: address = "oct1111111111111111111111111111111111111111111"
+  const MAX_SUPPLY: u128 = 10000
+  const MAX_SUPPLY_U64: u64 = 10000
+  const MAX_PER_WALLET_U64: u64 = 5
+  const MINT_PRICE_RAW: u128 = 100000000
+  const SEED_SALT: string = "OCH01:v1"
+  const ROYALTY_BPS: u128 = 1000
+  const BPS_MAX: u128 = 10000
+
+  invariant balance_sum_matches_supply = sum(balances) == total_supply
+
+  state {
+    owner:             address
+    name:              string
+    symbol:            string
+    decimals:          u64
+    total_supply:      u128
+    next_id:           u64
+    balances:          map[address]u128
+    owner_of_token:    map[u64]address
+    approved_for:      map[u64]address
+    seed_of_token:     map[u64]string
+    mint_epoch_of:     map[u64]int
+    minted_by:         map[address]u64
+    provenance_hash:   string
+    provenance_locked: u64
+    renderer_circle:   address
+    metadata_circle:   address
+    royalty_recip:     address
+    proceeds:          u128
+    mint_price:        u128
+    mint_price_locked: u64
+  }
+
+  event Minted(to: address, token_id: u64, seed_hex: string, at_epoch: int)
+  event Transferred(from_addr: address, to: address, token_id: u64)
+  event Approved(owner_addr: address, spender: address, token_id: u64)
+  event ProvenanceSet(hash_str: string)
+  event ProvenanceLocked(at_epoch: int)
+  event RendererCircleSet(circle_addr: address)
+  event MetadataCircleSet(circle_addr: address)
+  event RoyaltyRecipSet(prev: address, next_addr: address)
+  event MintPriceSet(prev: u128, next_price: u128)
+  event MintPriceLocked(at_epoch: int)
+  event ProceedsSwept(to: address, amount: u128, remaining: u128)
+  event OwnershipTransferred(prev_owner: address, new_owner: address)
+
+  constructor(collection_name: string, collection_symbol: string) {
+    self.owner = origin
+    self.name = collection_name
+    self.symbol = collection_symbol
+    self.decimals = 0
+    self.total_supply = 0
+    self.next_id = 0
+    self.provenance_hash = ""
+    self.provenance_locked = 0
+    self.renderer_circle = ZERO_ADDRESS
+    self.metadata_circle = ZERO_ADDRESS
+    self.royalty_recip = origin
+    self.proceeds = 0
+    self.mint_price = MINT_PRICE_RAW
+    self.mint_price_locked = 0
+  }
+
+  private fn only_owner() {
+    require(caller == self.owner, "not owner")
+  }
+
+  private fn require_provenance_locked() {
+    require(self.provenance_locked == 1, "provenance not locked")
+  }
+
+  private fn require_provenance_unlocked() {
+    require(self.provenance_locked == 0, "provenance locked")
+  }
+
+  private fn safe_add_u128(left: u128, right: u128): u128 {
+    let out: u128 = left + right
+    require(out >= left, "u128 overflow")
+    return out
+  }
+
+  private fn safe_add_u64(left: u64, right: u64): u64 {
+    let out: u64 = left + right
+    require(out >= left, "u64 overflow")
+    return out
+  }
+
+  payable fn mint(): u64 {
+    assert_address(caller)
+    require(caller != ZERO_ADDRESS, "zero caller")
+    require_provenance_locked()
+    require(self.renderer_circle != ZERO_ADDRESS, "renderer unset")
+    require(self.metadata_circle != ZERO_ADDRESS, "metadata unset")
+    let already: u64 = self.minted_by[caller]
+    require(value >= self.mint_price, "insufficient OCT")
+
+    let new_proceeds: u128 = safe_add_u128(self.proceeds, self.mint_price)
+    let new_minted: u64 = safe_add_u64(already, 1)
+    require(new_minted <= MAX_PER_WALLET_U64, "per-wallet cap reached")
+    let new_id: u64 = self.next_id
+    require(new_id < MAX_SUPPLY_U64, "sold out")
+
+    let seed_input: string = concat(SEED_SALT, concat(":", to_string(new_id)))
+    let seed_hex: string = digest_sha256(seed_input)
+
+    self.proceeds = new_proceeds
+    self.minted_by[caller] = new_minted
+    self.next_id = safe_add_u64(new_id, 1)
+    self.owner_of_token[new_id] = caller
+    self.seed_of_token[new_id] = seed_hex
+    self.mint_epoch_of[new_id] = epoch
+
+    let new_supply: u128 = safe_add_u128(self.total_supply, 1)
+    require(new_supply <= MAX_SUPPLY, "sold out")
+    let new_bal: u128 = safe_add_u128(self.balances[caller], 1)
+    self.balances[caller] = new_bal
+    self.total_supply = new_supply
+
+    emit Minted(caller, new_id, seed_hex, epoch)
+    emit Transferred(ZERO_ADDRESS, caller, new_id)
+    return new_id
+  }
+
+  fn transfer(to: address, token_id: u64): bool {
+    assert_address(to)
+    require(to != ZERO_ADDRESS, "zero to")
+    require(to != caller, "self transfer disabled")
+    require(token_id < self.next_id, "not minted")
+    let cur_owner: address = self.owner_of_token[token_id]
+    require(cur_owner == caller, "not token owner")
+    let from_bal: u128 = self.balances[caller]
+    require(from_bal >= 1, "no balance")
+    let new_to_bal: u128 = safe_add_u128(self.balances[to], 1)
+    self.owner_of_token[token_id] = to
+    self.approved_for[token_id] = ZERO_ADDRESS
+    self.balances[caller] = from_bal - 1
+    self.balances[to] = new_to_bal
+    emit Transferred(caller, to, token_id)
+    return true
+  }
+
+  fn approve(spender: address, token_id: u64): bool {
+    assert_address(spender)
+    require(token_id < self.next_id, "not minted")
+    let cur_owner: address = self.owner_of_token[token_id]
+    require(cur_owner == caller, "not token owner")
+    self.approved_for[token_id] = spender
+    emit Approved(caller, spender, token_id)
+    return true
+  }
+
+  fn transfer_from(from_addr: address, to: address, token_id: u64): bool {
+    assert_address(from_addr)
+    assert_address(to)
+    require(to != ZERO_ADDRESS, "zero to")
+    require(from_addr != to, "self transfer disabled")
+    require(token_id < self.next_id, "not minted")
+    let cur_owner: address = self.owner_of_token[token_id]
+    require(cur_owner == from_addr, "from not owner")
+    let approved: address = self.approved_for[token_id]
+    require(approved == caller || from_addr == caller, "not approved or owner")
+    let from_bal: u128 = self.balances[from_addr]
+    require(from_bal >= 1, "no balance")
+    let new_to_bal: u128 = safe_add_u128(self.balances[to], 1)
+    self.owner_of_token[token_id] = to
+    self.approved_for[token_id] = ZERO_ADDRESS
+    self.balances[from_addr] = from_bal - 1
+    self.balances[to] = new_to_bal
+    emit Transferred(from_addr, to, token_id)
+    return true
+  }
+
+  fn set_provenance(hash_str: string): bool {
+    only_owner()
+    require_provenance_unlocked()
+    require(len(hash_str) > 0, "empty hash")
+    require(len(hash_str) <= 128, "hash too long")
+    self.provenance_hash = hash_str
+    emit ProvenanceSet(hash_str)
+    return true
+  }
+
+  fn lock_provenance(): bool {
+    only_owner()
+    require_provenance_unlocked()
+    require(len(self.provenance_hash) > 0, "no provenance set")
+    self.provenance_locked = 1
+    emit ProvenanceLocked(epoch)
+    return true
+  }
+
+  fn set_renderer_circle(circle_addr: address): bool {
+    only_owner()
+    assert_address(circle_addr)
+    require(circle_addr != ZERO_ADDRESS, "zero circle")
+    self.renderer_circle = circle_addr
+    emit RendererCircleSet(circle_addr)
+    return true
+  }
+
+  fn set_metadata_circle(circle_addr: address): bool {
+    only_owner()
+    assert_address(circle_addr)
+    require(circle_addr != ZERO_ADDRESS, "zero circle")
+    self.metadata_circle = circle_addr
+    emit MetadataCircleSet(circle_addr)
+    return true
+  }
+
+  fn set_royalty_recip(new_recip: address): bool {
+    only_owner()
+    assert_address(new_recip)
+    require(new_recip != ZERO_ADDRESS, "zero recip")
+    let prev: address = self.royalty_recip
+    require(new_recip != prev, "same recip")
+    self.royalty_recip = new_recip
+    emit RoyaltyRecipSet(prev, new_recip)
+    return true
+  }
+
+  fn set_mint_price(new_price: u128): bool {
+    only_owner()
+    require(self.mint_price_locked == 0, "mint price locked")
+    require(new_price > 0, "zero price")
+    let prev: u128 = self.mint_price
+    self.mint_price = new_price
+    emit MintPriceSet(prev, new_price)
+    return true
+  }
+
+  fn lock_mint_price(): bool {
+    only_owner()
+    require(self.mint_price_locked == 0, "already locked")
+    self.mint_price_locked = 1
+    emit MintPriceLocked(epoch)
+    return true
+  }
+
+  fn sweep_proceeds(amount: u128, to: address): bool {
+    only_owner()
+    assert_address(to)
+    require(to != ZERO_ADDRESS, "zero to")
+    require(amount > 0, "amount must be positive")
+    require(self.proceeds >= amount, "amount exceeds proceeds")
+    checkpoint()
+    self.proceeds = self.proceeds - amount
+    let ok: bool = transfer(to, amount)
+    require(ok, "transfer failed")
+    commit()
+    emit ProceedsSwept(to, amount, self.proceeds)
+    return true
+  }
+
+  fn transfer_ownership(new_owner: address): bool {
+    only_owner()
+    assert_address(new_owner)
+    require(new_owner != ZERO_ADDRESS, "zero new owner")
+    require(new_owner != self.owner, "same owner")
+    let prev: address = self.owner
+    self.owner = new_owner
+    emit OwnershipTransferred(prev, new_owner)
+    return true
+  }
+
+  view fn owner_of(token_id: u64): address {
+    require(token_id < self.next_id, "not minted")
+    return self.owner_of_token[token_id]
+  }
+
+  view fn balance_of(addr: address): u128 {
+    return self.balances[addr]
+  }
+
+  view fn seed_of(token_id: u64): string {
+    require(token_id < self.next_id, "not minted")
+    return self.seed_of_token[token_id]
+  }
+
+  view fn mint_epoch_of_token(token_id: u64): int {
+    require(token_id < self.next_id, "not minted")
+    return self.mint_epoch_of[token_id]
+  }
+
+  view fn minted_by_wallet(addr: address): u64 {
+    return self.minted_by[addr]
+  }
+
+  view fn get_approved(token_id: u64): address {
+    require(token_id < self.next_id, "not minted")
+    return self.approved_for[token_id]
+  }
+
+  view fn token_uri(token_id: u64): string {
+    require(token_id < self.next_id, "not minted")
+    require(self.metadata_circle != ZERO_ADDRESS, "metadata unset")
+    let circle_str: string = to_string(self.metadata_circle)
+    return concat("oct://", concat(circle_str, concat("/", concat(to_string(token_id), ".json"))))
+  }
+
+  view fn royalty_info(token_id: u64, sale_price: u128): (address, u128) {
+    require(token_id < self.next_id, "not minted")
+    require(sale_price > 0, "sale price must be positive")
+    let amount: u128 = sale_price * ROYALTY_BPS / BPS_MAX
+    return (self.royalty_recip, amount)
+  }
+
+  view fn royalty_of(token_id: u64): u128 {
+    require(token_id < self.next_id, "not minted")
+    return ROYALTY_BPS
+  }
+
+  view fn creator_of(token_id: u64): address {
+    require(token_id < self.next_id, "not minted")
+    return self.royalty_recip
+  }
+
+  view fn get_name(): string { return self.name }
+  view fn get_symbol(): string { return self.symbol }
+  view fn get_decimals(): u64 { return self.decimals }
+  view fn get_total_supply(): u128 { return self.total_supply }
+  view fn get_max_supply(): u128 { return MAX_SUPPLY }
+  view fn get_max_per_wallet(): u64 { return MAX_PER_WALLET_U64 }
+  view fn get_mint_price(): u128 { return self.mint_price }
+  view fn is_mint_price_locked(): u64 { return self.mint_price_locked }
+  view fn get_owner(): address { return self.owner }
+  view fn get_renderer_circle(): address { return self.renderer_circle }
+  view fn get_metadata_circle(): address { return self.metadata_circle }
+  view fn get_royalty_recip(): address { return self.royalty_recip }
+  view fn get_royalty_bps(): u128 { return ROYALTY_BPS }
+  view fn get_provenance(): string { return self.provenance_hash }
+  view fn is_provenance_locked(): u64 { return self.provenance_locked }
+  view fn get_proceeds(): u128 { return self.proceeds }
+  view fn get_next_id(): u64 { return self.next_id }
+
+  fn owner_of_call(token_id: u64): address {
+    require(token_id < self.next_id, "not minted")
+    return self.owner_of_token[token_id]
+  }
+
+  fn balance_of_call(addr: address): u128 {
+    return self.balances[addr]
+  }
+
+  fn seed_of_call(token_id: u64): string {
+    require(token_id < self.next_id, "not minted")
+    return self.seed_of_token[token_id]
+  }
+
+  fn get_total_supply_call(): u128 { return self.total_supply }
+}
